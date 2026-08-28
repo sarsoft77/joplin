@@ -3,15 +3,18 @@
 Конвертер экспорта Joplin (RAW - Joplin Export Directory) в Obsidian vault.
 
 Использование:
-    python3 joplin_to_obsidian.py /путь/к/RAW-экспорту /путь/к/выходной/папке
+    python3 joplin_to_obsidian.py /путь/к/RAW-экспорту /путь/к/выходной/папке [--keep-html]
 
 Что делает:
 - Разбирает все .md-файлы raw-экспорта на (title, body, metadata)
 - Строит дерево блокнотов (type_: 2) -> путь папок
 - Строит карту id ресурса (type_: 4) -> реальное имя файла с расширением
 - Строит карту id тега (type_: 5) и связей заметка-тег (type_: 6)
-- Для заметок с markup_language: 2 (HTML, обычно после CherryTree/Evernote)
-  конвертирует HTML в Markdown через markdownify
+- Для заметок с markup_language: 2 (HTML, обычно после CherryTree/Evernote):
+    - по умолчанию конвертирует HTML в Markdown через markdownify
+    - с флагом --keep-html оставляет исходный HTML как есть внутри .md
+      (Obsidian умеет рендерить HTML-теги внутри markdown-заметок,
+      это может лучше сохранить сложные таблицы и вёрстку)
 - Заменяет ссылки вида :/<32-символьный-id> на:
     - ![[attachments/имя_файла]] для картинок/файлов
     - [[Название заметки]] для ссылок на другие заметки
@@ -121,7 +124,20 @@ def convert_html_to_md(html: str) -> str:
     return md(str(body_tag), heading_style="ATX")
 
 
-def main(src_dir: str, out_dir: str):
+def extract_body_html(html: str) -> str:
+    """Возвращает содержимое <body> как есть (без конвертации в markdown),
+    только убирая <head> и внешние html/body теги - Obsidian отрендерит
+    вложенный HTML прямо внутри .md заметки."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.head:
+        soup.head.decompose()
+    if soup.body:
+        return soup.body.decode_contents().strip()
+    return str(soup).strip()
+
+
+def main(src_dir: str, out_dir: str, keep_html: bool = False):
     src = Path(src_dir)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -260,7 +276,10 @@ def main(src_dir: str, out_dir: str):
                     return f"{target_name}.md"
                 return m.group(0)
             body = link_re.sub(html_repl, body)
-            body = convert_html_to_md(body)
+            if keep_html:
+                body = extract_body_html(body)
+            else:
+                body = convert_html_to_md(body)
         else:
             body = replace_links(body, is_html=False)
 
@@ -288,7 +307,12 @@ def main(src_dir: str, out_dir: str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Использование: python3 joplin_to_obsidian.py <raw_export_dir> <output_dir>")
+    args = sys.argv[1:]
+    keep_html = "--keep-html" in args
+    args = [a for a in args if a != "--keep-html"]
+    if len(args) != 2:
+        print("Использование: python3 joplin_to_obsidian.py <raw_export_dir> <output_dir> [--keep-html]")
+        print("  --keep-html  не конвертировать HTML-заметки в markdown, "
+              "оставить исходный HTML внутри .md (Obsidian отрендерит его сам)")
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2])
+    main(args[0], args[1], keep_html=keep_html)
