@@ -3,7 +3,7 @@
 Конвертер экспорта Joplin (RAW - Joplin Export Directory) в Obsidian vault.
 
 Использование:
-    python3 joplin_to_obsidian.py /путь/к/RAW-экспорту /путь/к/выходной/папке [--keep-html]
+    python3 joplin_to_obsidian.py /путь/к/RAW-экспорту /путь/к/выходной/папке [флаги]
 
 Что делает:
 - Разбирает все .md-файлы raw-экспорта на (title, body, metadata)
@@ -15,6 +15,10 @@
     - с флагом --keep-html оставляет исходный HTML как есть внутри .md
       (Obsidian умеет рендерить HTML-теги внутри markdown-заметок,
       это может лучше сохранить сложные таблицы и вёрстку)
+    - по умолчанию (можно отключить флагом --no-attach-html-source)
+      точная копия оригинального HTML сохраняется в html_originals/,
+      а в конвертированную заметку добавляется ссылка на неё - на случай,
+      если конвертация что-то исказит, оригинал всегда под рукой
 - Заменяет ссылки вида :/<32-символьный-id> на:
     - ![[attachments/имя_файла]] для картинок/файлов
     - [[Название заметки]] для ссылок на другие заметки
@@ -68,6 +72,13 @@ def truncate_filename(fname: str) -> str:
     suffix = Path(fname).suffix
     keep = MAX_FILENAME_LEN - len(suffix)
     return stem[:keep] + suffix
+
+
+def url_encode_path(path_str: str) -> str:
+    """Процентно кодирует пробелы и спецсимволы в относительном пути для markdown-ссылки
+    вида [текст](путь) - пробел без кодирования обрывает markdown-ссылку на первом же
+    пробеле. Слэши-разделители сохраняем как есть."""
+    return urllib.parse.quote(path_str, safe="/")
 
 
 def parse_raw_note(path: Path):
@@ -137,12 +148,16 @@ def extract_body_html(html: str) -> str:
     return str(soup).strip()
 
 
-def main(src_dir: str, out_dir: str, keep_html: bool = False):
+def main(src_dir: str, out_dir: str, keep_html: bool = False,
+         attach_html_source: bool = True, html_source_position: str = "bottom"):
     src = Path(src_dir)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     attachments_dir = out / "attachments"
     attachments_dir.mkdir(exist_ok=True)
+    html_originals_dir = out / "html_originals"
+    if attach_html_source:
+        html_originals_dir.mkdir(exist_ok=True)
 
     notes, folders, resources, tags, note_tags = {}, {}, {}, {}, []
 
@@ -224,16 +239,22 @@ def main(src_dir: str, out_dir: str, keep_html: bool = False):
 
     link_re = re.compile(r':/([0-9a-fA-F]{32})')
 
+    def note_root_link(target_id: str) -> str:
+        """Полный путь к заметке от корня vault, с учётом её блокнота-подпапки,
+        закодированный и с ведущим /, например /Компьютеры/Заметка.md"""
+        target_folder = folder_path(notes[target_id]["meta"].get("parent_id", ""))
+        folder_prefix = (target_folder.as_posix() + "/") if target_folder != Path(".") else ""
+        return "/" + url_encode_path(folder_prefix + note_filename[target_id])
+
     def replace_links(text, is_html):
         def repl(m):
             target_id = m.group(1)
             if target_id in resource_filename:
-                return f"attachments/{resource_filename[target_id]}"
+                return f"/attachments/{url_encode_path(resource_filename[target_id])}"
             elif target_id in notes:
-                target_name = note_filename[target_id][:-3]  # без .md
                 if is_html:
-                    return f"[[{target_name}]]"
-                return f"{target_name}"
+                    return f"[[{note_filename[target_id][:-3]}]]"
+                return note_root_link(target_id)
             return m.group(0)
         return link_re.sub(repl, text)
 
@@ -262,18 +283,35 @@ def main(src_dir: str, out_dir: str, keep_html: bool = False):
         meta = n["meta"]
         body = n["body"]
         is_html = meta.get("markup_language") == "2"
+        rel_folder = folder_path(meta.get("parent_id", ""))
+        html_source_note = ""  # текст, который вставим в заметку как ссылку на оригинал
 
         if is_html:
+            original_html = body  # точная копия ДО любых замен ссылок/конвертации
+
+            if attach_html_source:
+                html_target_dir = html_originals_dir / rel_folder
+                html_target_dir.mkdir(parents=True, exist_ok=True)
+                html_filename = truncate_filename(note_filename[nid][:-3] + ".html")
+                html_path = html_target_dir / html_filename
+                try:
+                    html_path.write_text(original_html, encoding="utf-8")
+                    # путь от корня vault: /html_originals/<блокнот>/имя.html
+                    folder_prefix = (rel_folder.as_posix() + "/") if rel_folder != Path(".") else ""
+                    link_path = "/html_originals/" + url_encode_path(folder_prefix + html_filename)
+                    html_source_note = f"📄 [Исходный HTML-файл заметки]({link_path})"
+                except OSError as e:
+                    print(f"  ! Не удалось сохранить оригинал HTML для '{n['title']}': {e}")
+
             # ссылки лежат в src=/href=":/id" - подменим их ДО конвертации в markdown,
             # чтобы markdownify сам превратил <a href="target"> и <img src="target">
             # в нормальные markdown-ссылки/картинки
             def html_repl(m):
                 target_id = m.group(1)
                 if target_id in resource_filename:
-                    return f"attachments/{resource_filename[target_id]}"
+                    return f"/attachments/{url_encode_path(resource_filename[target_id])}"
                 elif target_id in notes:
-                    target_name = note_filename[target_id][:-3]
-                    return f"{target_name}.md"
+                    return note_root_link(target_id)
                 return m.group(0)
             body = link_re.sub(html_repl, body)
             if keep_html:
@@ -292,11 +330,17 @@ def main(src_dir: str, out_dir: str, keep_html: bool = False):
         fm_lines.append("---\n")
         frontmatter = "\n".join(fm_lines)
 
-        rel_folder = folder_path(meta.get("parent_id", ""))
+        if html_source_note and html_source_position == "top":
+            full_body = html_source_note + "\n\n---\n\n" + body.strip() + "\n"
+        elif html_source_note:  # bottom (по умолчанию)
+            full_body = body.strip() + "\n\n---\n\n" + html_source_note + "\n"
+        else:
+            full_body = body.strip() + "\n"
+
         target_dir = out / rel_folder
         target_dir.mkdir(parents=True, exist_ok=True)
         target_file = target_dir / note_filename[nid]
-        target_file.write_text(frontmatter + body.strip() + "\n", encoding="utf-8")
+        target_file.write_text(frontmatter + full_body, encoding="utf-8")
       except Exception as e:
         note_errors += 1
         print(f"  ! Ошибка обработки заметки id={nid} ({n.get('title','')}): {e}")
@@ -309,10 +353,22 @@ def main(src_dir: str, out_dir: str, keep_html: bool = False):
 if __name__ == "__main__":
     args = sys.argv[1:]
     keep_html = "--keep-html" in args
-    args = [a for a in args if a != "--keep-html"]
+    attach_html_source = "--no-attach-html-source" not in args
+    html_source_position = "bottom"
+    if "--html-source-position=top" in args:
+        html_source_position = "top"
+    args = [a for a in args if a not in ("--keep-html", "--no-attach-html-source")
+            and not a.startswith("--html-source-position=")]
     if len(args) != 2:
-        print("Использование: python3 joplin_to_obsidian.py <raw_export_dir> <output_dir> [--keep-html]")
-        print("  --keep-html  не конвертировать HTML-заметки в markdown, "
-              "оставить исходный HTML внутри .md (Obsidian отрендерит его сам)")
+        print("Использование: python3 joplin_to_obsidian.py <raw_export_dir> <output_dir> "
+              "[--keep-html] [--no-attach-html-source] [--html-source-position=top|bottom]")
+        print("  --keep-html                  не конвертировать HTML-заметки в markdown, "
+              "оставить исходный HTML внутри .md")
+        print("  --no-attach-html-source       НЕ сохранять оригинальный HTML-файл заметки "
+              "(по умолчанию он сохраняется в html_originals/ со ссылкой из заметки)")
+        print("  --html-source-position=...    где вставлять ссылку на оригинал: top или "
+              "bottom (по умолчанию bottom)")
         sys.exit(1)
-    main(args[0], args[1], keep_html=keep_html)
+    main(args[0], args[1], keep_html=keep_html,
+         attach_html_source=attach_html_source,
+         html_source_position=html_source_position)
